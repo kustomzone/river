@@ -7,7 +7,15 @@ framework.
 
 ![Screenshot of chat interface](screenshot-20241009.png)
 
-## Roadmap (Jan 2025)
+## Status (Dec 2025)
+
+- [x] Connecting on Linux distros including WSL
+ - [x] WSL v1 - Ubuntu 24.04
+
+- [ ] Win 10
+ - [ ] pending results
+
+## Roadmap (Jan 2026)
 
 - [x] [Scaffold library](https://github.com/freenet/river/tree/main/scaffold) and
       [macro](https://github.com/freenet/river/tree/main/scaffold-macro) to simplify contract
