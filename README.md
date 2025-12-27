@@ -10,10 +10,10 @@ framework.
 ## Status (Dec 2025)
 
 - [x] Connecting on Linux distros including WSL
- - [x] WSL v1 - Ubuntu 24.04
+  - [x] WSL v1 - Ubuntu 24.04
 
 - [ ] Win 10
- - [ ] pending results
+  - [ ] pending results
 
 ## Roadmap (Jan 2026)
 
