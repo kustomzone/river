@@ -4,7 +4,6 @@ pub mod notifications;
 pub mod sync_info;
 
 use super::{conversation::Conversation, members::MemberList, room_list::RoomList};
-use crate::components::app::chat_delegate::set_up_chat_delegate;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
 use crate::components::app::freenet_api::FreenetSynchronizer;
@@ -21,10 +20,8 @@ use document::Stylesheet;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::client_api::WebApi;
 use river_core::room_state::member::MemberId;
-use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
-use wasm_bindgen_futures::JsFuture;
-use web_sys::{window, Response};
+use web_sys::window;
 
 pub static ROOMS: GlobalSignal<Rooms> = Global::new(initial_rooms);
 pub static CURRENT_ROOM: GlobalSignal<CurrentRoom> =
@@ -47,30 +44,30 @@ pub static AUTH_TOKEN: GlobalSignal<Option<String>> = Global::new(|| None);
 pub static NEEDS_SYNC: GlobalSignal<std::collections::HashSet<VerifyingKey>> =
     Global::new(std::collections::HashSet::new);
 
+// Build metadata from build.rs
+const BUILD_TIMESTAMP: &str = env!("BUILD_TIMESTAMP_ISO");
+const GIT_COMMIT: &str = env!("GIT_COMMIT_HASH");
+
 #[component]
 pub fn App() -> Element {
-    info!("Loaded App component");
+    info!(
+        "River UI loaded - Built: {} | Commit: {}",
+        BUILD_TIMESTAMP, GIT_COMMIT
+    );
 
     let mut receive_invitation = use_signal(|| None::<Invitation>);
 
-    // Read authorization header on mount and store in global
-    //  use_effect(|| {
+    // Get auth token from window global (injected by Freenet gateway)
+    // This is synchronous - no network request needed
+    get_auth_token_from_window();
+
+    // Start synchronizer - auth token is already available
     spawn_local(async {
-        // First, try to get the auth token
-        fetch_auth_token().await;
-
-        // Now that we've tried to get the auth token, start the synchronizer
         debug!("Starting FreenetSynchronizer from App component");
-
-        // Start the synchronizer directly
-        {
-            let mut synchronizer = SYNCHRONIZER.write();
-            synchronizer.start().await;
-        }
-
-        let _ = set_up_chat_delegate().await;
+        // Note: The synchronizer will set up the chat delegate after connection is established
+        let mut synchronizer = SYNCHRONIZER.write();
+        synchronizer.start().await;
     });
-    //  });
 
     // Check URL for invitation parameter
     if let Some(window) = window() {
@@ -80,6 +77,18 @@ pub fn App() -> Element {
                     if let Ok(invitation) = Invitation::from_encoded_string(&invitation_code) {
                         info!("Received invitation: {:?}", invitation);
                         receive_invitation.set(Some(invitation));
+
+                        // Remove invitation parameter from URL to prevent re-processing on refresh
+                        params.delete("invitation");
+                        let new_search = params.to_string().as_string().unwrap_or_default();
+                        let new_url = if new_search.is_empty() {
+                            window.location().pathname().unwrap_or_default()
+                        } else {
+                            format!("{}?{}", window.location().pathname().unwrap_or_default(), new_search)
+                        };
+                        if let Ok(history) = window.history() {
+                            let _ = history.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&new_url));
+                        }
                     }
                 }
             }
@@ -141,38 +150,6 @@ pub fn App() -> Element {
         Stylesheet { href: asset!("./assets/styles.css") }
         Stylesheet { href: asset!("./assets/fontawesome/css/all.min.css") }
 
-        // Status indicator for Freenet connection
-        div {
-            class: format!(
-                "fixed top-3 right-3 px-3 py-1.5 rounded-full flex items-center text-sm font-medium z-50 shadow-sm {}",
-                match &*SYNC_STATUS.read() {
-                    SynchronizerStatus::Connected => "bg-success-bg text-green-700 dark:text-green-400 border border-green-200 dark:border-green-800",
-                    SynchronizerStatus::Connecting => "bg-warning-bg text-yellow-700 dark:text-yellow-400 border border-yellow-200 dark:border-yellow-800",
-                    SynchronizerStatus::Disconnected | SynchronizerStatus::Error(_) => "bg-error-bg text-red-700 dark:text-red-400 border border-red-200 dark:border-red-800",
-                }
-            ),
-            div {
-                class: format!(
-                    "w-2.5 h-2.5 rounded-full mr-2 {}",
-                    match &*SYNC_STATUS.read() {
-                        SynchronizerStatus::Connected => "bg-green-500",
-                        SynchronizerStatus::Connecting => "bg-yellow-500",
-                        SynchronizerStatus::Disconnected | SynchronizerStatus::Error(_) => "bg-red-500",
-                    }
-                ),
-            }
-            span {
-                {
-                    match &*SYNC_STATUS.read() {
-                        SynchronizerStatus::Connected => "Connected".to_string(),
-                        SynchronizerStatus::Connecting => "Connecting...".to_string(),
-                        SynchronizerStatus::Disconnected => "Disconnected".to_string(),
-                        SynchronizerStatus::Error(ref msg) => format!("Error: {}", msg),
-                    }
-                }
-            }
-        }
-
         // Main chat layout - grid with fixed sidebars and flexible center
         div { class: "flex h-screen bg-bg",
             RoomList {}
@@ -213,34 +190,24 @@ pub struct MemberInfoModalSignal {
     pub member: Option<MemberId>,
 }
 
-/// Fetches the authorization token from the current page's headers
-/// and stores it in the AUTH_TOKEN global signal
-async fn fetch_auth_token() {
+/// Gets the authorization token from the window global variable.
+/// The Freenet HTTP gateway injects this token into the HTML as:
+/// <script>window.__FREENET_AUTH_TOKEN__ = "token_value";</script>
+fn get_auth_token_from_window() {
     if let Some(win) = window() {
-        let href = win.location().href().unwrap_or_default();
-
-        match JsFuture::from(win.fetch_with_str(&href)).await {
-            Ok(resp_value) => {
-                if let Ok(resp) = resp_value.dyn_into::<Response>() {
-                    if let Ok(Some(token)) = resp.headers().get("authorization") {
-                        info!("Found auth token: {}", token);
-
-                        // Extract the token part without the "Bearer" prefix
-                        if token.starts_with("Bearer ") {
-                            let token_part = token.trim_start_matches("Bearer ").trim();
-                            *AUTH_TOKEN.write() = Some(token_part.to_string());
-                            debug!("Stored token value: {}", token_part);
-                        } else {
-                            // If it doesn't have the expected format, store as-is
-                            *AUTH_TOKEN.write() = Some(token);
-                        }
-                    } else {
-                        debug!("Authorization header missing or not exposed");
-                    }
+        match js_sys::Reflect::get(&win, &"__FREENET_AUTH_TOKEN__".into()) {
+            Ok(token_value) => {
+                if let Some(token) = token_value.as_string() {
+                    info!("Found auth token from window global");
+                    *AUTH_TOKEN.write() = Some(token);
+                } else if token_value.is_undefined() || token_value.is_null() {
+                    debug!("Auth token not injected by gateway (running locally?)");
+                } else {
+                    debug!("Auth token has unexpected type");
                 }
             }
             Err(err) => {
-                error!("Failed to fetch page for auth header: {:?}", err);
+                error!("Failed to read auth token from window: {:?}", err);
             }
         }
     }

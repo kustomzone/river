@@ -4,6 +4,7 @@ use super::connection_manager::ConnectionManager;
 use super::error::SynchronizerError;
 use super::response_handler::ResponseHandler;
 use super::room_synchronizer::RoomSynchronizer;
+use crate::components::app::chat_delegate::set_up_chat_delegate;
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{ROOMS, SYNC_STATUS, WEB_API};
 use crate::util::{owner_vk_to_contract_key, sleep};
@@ -18,12 +19,18 @@ use futures::StreamExt;
 use river_core::room_state::member::AuthorizedMember;
 use river_core::room_state::member::MemberId;
 use std::time::Duration;
+use wasm_bindgen::prelude::Closure;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
 /// Message types for communicating with the synchronizer
 pub enum SynchronizerMessage {
     ProcessRooms,
     Connect,
+    /// Sent when WebSocket connection is lost (closed or errored)
+    ConnectionLost,
+    /// Sent when page becomes visible after being hidden (e.g., after sleep/wake)
+    PageBecameVisible,
     ApiResponse(Result<HostResponse, SynchronizerError>),
     AcceptInvitation {
         owner_vk: VerifyingKey,
@@ -100,6 +107,35 @@ impl FreenetSynchronizer {
 
         info!("Starting message processing loop");
         spawn_local(async move {
+            // Set up Page Visibility API listener to detect sleep/wake cycles
+            // When computer wakes from sleep, we need to check if connection is still alive
+            let visibility_tx = message_tx.clone();
+            if let Some(window) = web_sys::window() {
+                if let Some(document) = window.document() {
+                    let callback = Closure::<dyn Fn()>::new(move || {
+                        if let Some(window) = web_sys::window() {
+                            if let Some(document) = window.document() {
+                                if document.visibility_state() == web_sys::VisibilityState::Visible {
+                                    info!("Page became visible, checking connection health");
+                                    if let Err(e) = visibility_tx.unbounded_send(SynchronizerMessage::PageBecameVisible) {
+                                        error!("Failed to send PageBecameVisible message: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    if let Err(e) = document.add_event_listener_with_callback(
+                        "visibilitychange",
+                        callback.as_ref().unchecked_ref(),
+                    ) {
+                        error!("Failed to add visibility change listener: {:?}", e);
+                    }
+                    // Keep the closure alive for the lifetime of the app
+                    callback.forget();
+                    info!("Page Visibility listener installed for sleep/wake detection");
+                }
+            }
+
             info!("Sending initial Connect message");
             if let Err(e) = message_tx.unbounded_send(SynchronizerMessage::Connect) {
                 error!("Failed to send Connect message: {}", e);
@@ -126,8 +162,50 @@ impl FreenetSynchronizer {
                             .await
                         {
                             error!("Error processing rooms: {}", e);
+                            // Check if this is a WebSocket error that needs reconnection
+                            let error_str = e.to_string();
+                            if error_str.contains("WebSocket") || error_str.contains("not open") {
+                                warn!("WebSocket error during room processing, triggering reconnection");
+                                if let Err(e) = message_tx.unbounded_send(SynchronizerMessage::ConnectionLost) {
+                                    error!("Failed to send ConnectionLost: {}", e);
+                                }
+                            }
                         } else {
                             info!("Successfully processed rooms");
+                        }
+                    }
+                    SynchronizerMessage::ConnectionLost => {
+                        warn!("WebSocket connection lost, scheduling reconnection");
+                        // Clear the web API so is_connected() returns false
+                        WEB_API.write().take();
+                        *SYNC_STATUS.write() = SynchronizerStatus::Disconnected;
+
+                        // Schedule reconnection after a delay
+                        let tx = message_tx.clone();
+                        spawn_local(async move {
+                            info!("Waiting 3 seconds before reconnection attempt...");
+                            sleep(Duration::from_millis(3000)).await;
+                            if let Err(e) = tx.unbounded_send(SynchronizerMessage::Connect) {
+                                error!("Failed to send reconnect message: {}", e);
+                            }
+                        });
+                    }
+                    SynchronizerMessage::PageBecameVisible => {
+                        // Page became visible after being hidden (e.g., after sleep/wake)
+                        // Check if we're still connected, if not trigger reconnection
+                        info!("Page visibility changed to visible, checking connection status");
+                        if !connection_manager.is_connected() {
+                            info!("Connection is not active after wake, triggering reconnection");
+                            if let Err(e) = message_tx.unbounded_send(SynchronizerMessage::Connect) {
+                                error!("Failed to send Connect message after wake: {}", e);
+                            }
+                        } else {
+                            // Connection appears active, trigger a room sync to verify
+                            // This will fail fast if the connection is actually dead
+                            info!("Connection appears active, triggering room sync to verify");
+                            if let Err(e) = message_tx.unbounded_send(SynchronizerMessage::ProcessRooms) {
+                                error!("Failed to send ProcessRooms message after wake: {}", e);
+                            }
                         }
                     }
                     SynchronizerMessage::Connect => {
@@ -138,7 +216,15 @@ impl FreenetSynchronizer {
                         {
                             Ok(()) => {
                                 info!("Connection established successfully");
-                                if let Some(_web_api) = &mut *WEB_API.write() {
+                                // Check if web API is available without holding the lock
+                                // during process_rooms() call
+                                let api_available = WEB_API.read().is_some();
+                                if api_available {
+                                    // Set up the chat delegate to load rooms from storage
+                                    if let Err(e) = set_up_chat_delegate().await {
+                                        error!("Failed to set up chat delegate: {}", e);
+                                    }
+
                                     info!("Processing rooms after successful connection");
                                     if let Err(e) = response_handler
                                         .get_room_synchronizer_mut()
@@ -186,7 +272,7 @@ impl FreenetSynchronizer {
                                                 OutboundDelegateMsg::ApplicationMessage(
                                                     app_msg,
                                                 ) => {
-                                                    info!("Value #{} is ApplicationMessage, processed: {}, payload size: {}", 
+                                                    info!("Value #{} is ApplicationMessage, processed: {}, payload size: {}",
                                                           i, app_msg.processed, app_msg.payload.len());
                                                 }
                                                 _ => info!("Value #{} is: {:?}", i, v),
@@ -196,10 +282,48 @@ impl FreenetSynchronizer {
                                     _ => info!("Other response type: {:?}", host_response),
                                 }
 
-                                if let Err(e) =
-                                    response_handler.handle_api_response(host_response).await
-                                {
-                                    error!("Error handling API response: {}", e);
+                                match response_handler.handle_api_response(host_response).await {
+                                    Ok(flags) => {
+                                        if flags.needs_reput {
+                                            // Subscription failed but we have local state - schedule a re-PUT
+                                            info!("Scheduling re-PUT after subscription failure (waiting {}ms)",
+                                                  super::constants::REPUT_DELAY_MS);
+                                            let tx = message_tx.clone();
+                                            spawn_local(async move {
+                                                sleep(Duration::from_millis(
+                                                    super::constants::REPUT_DELAY_MS,
+                                                ))
+                                                .await;
+                                                info!("Re-PUT delay elapsed, triggering ProcessRooms to PUT contract");
+                                                if let Err(e) =
+                                                    tx.unbounded_send(SynchronizerMessage::ProcessRooms)
+                                                {
+                                                    error!("Failed to schedule re-PUT: {}", e);
+                                                }
+                                            });
+                                        }
+                                        if flags.subscriptions_initiated {
+                                            // Subscriptions were initiated - schedule a timeout check
+                                            info!("Scheduling subscription timeout check (waiting {}ms)",
+                                                  super::constants::REPUT_DELAY_MS);
+                                            let tx = message_tx.clone();
+                                            spawn_local(async move {
+                                                sleep(Duration::from_millis(
+                                                    super::constants::REPUT_DELAY_MS + 1000, // Add 1s buffer
+                                                ))
+                                                .await;
+                                                info!("Subscription timeout check triggered");
+                                                if let Err(e) =
+                                                    tx.unbounded_send(SynchronizerMessage::ProcessRooms)
+                                                {
+                                                    error!("Failed to schedule timeout check: {}", e);
+                                                }
+                                            });
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("Error handling API response: {}", e);
+                                    }
                                 }
                                 info!("Finished processing API response");
                             }

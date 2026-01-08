@@ -29,6 +29,15 @@ pub struct ResponseHandler {
     room_synchronizer: RoomSynchronizer,
 }
 
+/// Response flags returned from handle_api_response
+#[derive(Default)]
+pub struct ResponseFlags {
+    /// True if a re-PUT should be scheduled (subscription failed but we have local state)
+    pub needs_reput: bool,
+    /// True if subscriptions were initiated and need timeout monitoring
+    pub subscriptions_initiated: bool,
+}
+
 impl ResponseHandler {
     pub fn new(room_synchronizer: RoomSynchronizer) -> Self {
         Self { room_synchronizer }
@@ -42,11 +51,14 @@ impl ResponseHandler {
         }
     }
 
-    /// Handles individual API responses
+    /// Handles individual API responses.
+    /// Returns flags indicating what follow-up actions are needed.
     pub async fn handle_api_response(
         &mut self,
         response: HostResponse,
-    ) -> Result<(), SynchronizerError> {
+    ) -> Result<ResponseFlags, SynchronizerError> {
+        let mut flags = ResponseFlags::default();
+
         match response {
             HostResponse::Ok => {
                 info!("Received OK response from API");
@@ -75,7 +87,7 @@ impl ResponseHandler {
                     handle_update_response(key, summary.to_vec());
                 }
                 ContractResponse::SubscribeResponse { key, subscribed } => {
-                    handle_subscribe_response(key, subscribed);
+                    flags.needs_reput = handle_subscribe_response(key, subscribed);
                 }
                 _ => {
                     info!("Unhandled contract response: {:?}", contract_response);
@@ -195,6 +207,8 @@ impl ResponseHandler {
                                                                     "Successfully sent subscribe request for loaded room {:?}",
                                                                     contract_key.id()
                                                                 );
+                                                                // Mark that subscriptions were initiated so timeout monitoring can be scheduled
+                                                                flags.subscriptions_initiated = true;
                                                             }
                                                         }
                                                     }
@@ -261,7 +275,7 @@ impl ResponseHandler {
                 warn!("Unhandled API response: {:?}", response);
             }
         }
-        Ok(())
+        Ok(flags)
     }
 
     pub fn get_room_synchronizer_mut(&mut self) -> &mut RoomSynchronizer {

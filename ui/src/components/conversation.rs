@@ -1,7 +1,8 @@
+use crate::components::app::notifications::request_permission_on_first_message;
 use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, NEEDS_SYNC, ROOMS};
 use crate::room_data::SendMessageError;
 use crate::util::ecies::encrypt_with_symmetric_key;
-use crate::util::get_current_system_time;
+use crate::util::{format_utc_as_full_datetime, format_utc_as_local_time, get_current_system_time};
 mod message_input;
 mod not_member_notification;
 use self::not_member_notification::NotMemberNotification;
@@ -22,7 +23,6 @@ use std::time::Duration;
 /// A group of consecutive messages from the same sender within a time window
 #[derive(Clone, PartialEq)]
 struct MessageGroup {
-    #[allow(dead_code)]
     author_id: MemberId,
     author_name: String,
     is_self: bool,
@@ -61,7 +61,7 @@ fn group_messages(
             .unwrap_or_else(|| "Unknown".to_string());
 
         let content_text = decrypt_message_content(&message.message.content, room_secret, room_secret_version);
-        let content_html = markdown::to_html(&content_text);
+        let content_html = message_to_html(&content_text);
         let is_self = author_id == self_member_id;
 
         let grouped_message = GroupedMessage {
@@ -126,6 +126,116 @@ fn decrypt_message_content(
     }
 }
 
+/// Convert message text to HTML with clickable links that open in new tabs.
+///
+/// This function:
+/// 1. Auto-linkifies plain URLs (http/https) that aren't already in markdown link syntax
+/// 2. Converts markdown to HTML
+/// 3. Adds target="_blank" rel="noopener noreferrer" to all links for security
+fn message_to_html(text: &str) -> String {
+    // First, auto-linkify plain URLs that aren't already markdown links
+    let linkified = auto_linkify_urls(text);
+
+    // Convert markdown to HTML
+    let html = markdown::to_html(&linkified);
+
+    // Add target="_blank" and rel="noopener noreferrer" to all links
+    make_links_open_in_new_tab(&html)
+}
+
+/// Auto-linkify plain URLs that aren't already in markdown link syntax.
+/// Matches http:// and https:// URLs.
+fn auto_linkify_urls(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut chars = text.char_indices().peekable();
+
+    while let Some((i, c)) = chars.next() {
+        // Check if we're inside a markdown link [...](url) - skip the URL part
+        if c == ']' {
+            result.push(c);
+            if let Some(&(_, '(')) = chars.peek() {
+                // This is a markdown link, copy until closing paren
+                result.push(chars.next().unwrap().1); // '('
+                while let Some((_, ch)) = chars.next() {
+                    result.push(ch);
+                    if ch == ')' {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Check for URL start
+        let remaining = &text[i..];
+        if remaining.starts_with("http://") || remaining.starts_with("https://") {
+            // Check if this URL is already inside a markdown link by looking back
+            // for an unclosed '(' that follows ']'
+            let before = &text[..i];
+            let is_in_markdown_link = {
+                let mut depth = 0i32;
+                let mut in_link_url = false;
+                for ch in before.chars().rev() {
+                    if ch == ')' {
+                        depth += 1;
+                    } else if ch == '(' {
+                        if depth > 0 {
+                            depth -= 1;
+                        } else {
+                            in_link_url = true;
+                            break;
+                        }
+                    } else if ch == ']' && depth == 0 {
+                        // Found ']' before '(' - not in a link URL
+                        break;
+                    }
+                }
+                in_link_url
+            };
+
+            if is_in_markdown_link {
+                result.push(c);
+                continue;
+            }
+
+            // Extract the URL (until whitespace or certain punctuation at end)
+            let url_end = remaining
+                .find(|ch: char| ch.is_whitespace() || ch == '<' || ch == '>' || ch == '"')
+                .unwrap_or(remaining.len());
+
+            let mut url = &remaining[..url_end];
+
+            // Trim trailing punctuation that's likely not part of the URL
+            while url.ends_with(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']'))
+            {
+                url = &url[..url.len() - 1];
+            }
+
+            // Create markdown link
+            result.push('[');
+            result.push_str(url);
+            result.push_str("](");
+            result.push_str(url);
+            result.push(')');
+
+            // Skip the URL characters we just processed
+            for _ in 0..url.len() - 1 {
+                chars.next();
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
+/// Add target="_blank" and rel="noopener noreferrer" to all anchor tags in HTML.
+fn make_links_open_in_new_tab(html: &str) -> String {
+    // Replace <a href=" with <a target="_blank" rel="noopener noreferrer" href="
+    html.replace("<a href=\"", "<a target=\"_blank\" rel=\"noopener noreferrer\" href=\"")
+}
+
 #[component]
 pub fn Conversation() -> Element {
     let current_room_data = {
@@ -138,7 +248,6 @@ pub fn Conversation() -> Element {
         }
     };
     let last_chat_element = use_signal(|| None as Option<Rc<MountedData>>);
-    let mut new_message = use_signal(|| "".to_string());
 
     let current_room_label = use_memo({
         move || {
@@ -159,6 +268,29 @@ pub fn Conversation() -> Element {
         }
     });
 
+    // Memoize expensive message grouping (decryption + markdown parsing)
+    // This prevents re-computing on every render/keystroke
+    let message_groups = use_memo(move || {
+        let current_room = CURRENT_ROOM.read();
+        if let Some(key) = current_room.owner_key {
+            let rooms = ROOMS.read();
+            if let Some(room_data) = rooms.map.get(&key) {
+                let room_state = &room_data.room_state;
+                if !room_state.recent_messages.messages.is_empty() {
+                    let self_member_id = MemberId::from(&room_data.self_sk.verifying_key());
+                    return Some(group_messages(
+                        &room_state.recent_messages.messages,
+                        &room_state.member_info,
+                        self_member_id,
+                        room_data.current_secret,
+                        room_data.current_secret_version,
+                    ));
+                }
+            }
+        }
+        None
+    });
+
     // Trigger scroll to bottom when recent messages change
     use_effect(move || {
         let container = last_chat_element();
@@ -169,65 +301,67 @@ pub fn Conversation() -> Element {
         }
     });
 
+    // Message sending handler - receives message text from MessageInput component
     let handle_send_message = {
         let current_room_data = current_room_data.clone();
-        move || {
-            let message_text = new_message.peek().to_string();
-            if !message_text.is_empty() {
-                new_message.set(String::new());
-                if let (Some(current_room), Some(current_room_data)) =
-                    (CURRENT_ROOM.read().owner_key, current_room_data)
-                {
-                    // Encrypt message if room is private and we have the secret
-                    let content = if current_room_data.is_private() {
-                        if let Some((secret, version)) = current_room_data.get_secret() {
-                            let (ciphertext, nonce) =
-                                encrypt_with_symmetric_key(secret, message_text.as_bytes());
-                            RoomMessageBody::Private {
-                                ciphertext,
-                                nonce,
-                                secret_version: version,
-                            }
-                        } else {
-                            warn!("Room is private but no secret available, sending as public");
-                            RoomMessageBody::public(message_text.clone())
+        move |message_text: String| {
+            if message_text.is_empty() {
+                warn!("Message is empty");
+                return;
+            }
+            if let (Some(current_room), Some(current_room_data)) =
+                (CURRENT_ROOM.read().owner_key, current_room_data.clone())
+            {
+                // Encrypt message if room is private and we have the secret
+                let content = if current_room_data.is_private() {
+                    if let Some((secret, version)) = current_room_data.get_secret() {
+                        let (ciphertext, nonce) =
+                            encrypt_with_symmetric_key(secret, message_text.as_bytes());
+                        RoomMessageBody::Private {
+                            ciphertext,
+                            nonce,
+                            secret_version: version,
                         }
                     } else {
+                        warn!("Room is private but no secret available, sending as public");
                         RoomMessageBody::public(message_text.clone())
-                    };
+                    }
+                } else {
+                    RoomMessageBody::public(message_text.clone())
+                };
 
-                    let message = MessageV1 {
-                        room_owner: MemberId::from(current_room),
-                        author: MemberId::from(&current_room_data.self_sk.verifying_key()),
-                        content,
-                        time: get_current_system_time(),
-                    };
-                    let auth_message =
-                        AuthorizedMessageV1::new(message, &current_room_data.self_sk);
-                    let delta = ChatRoomStateV1Delta {
-                        recent_messages: Some(vec![auth_message.clone()]),
-                        ..Default::default()
-                    };
-                    info!("Sending message: {:?}", auth_message);
-                    ROOMS.with_mut(|rooms| {
-                        if let Some(room_data) = rooms.map.get_mut(&current_room) {
-                            if let Err(e) = room_data.room_state.apply_delta(
-                                &current_room_data.room_state,
-                                &ChatRoomParametersV1 {
-                                    owner: current_room,
-                                },
-                                &Some(delta),
-                            ) {
-                                error!("Failed to apply message delta: {:?}", e);
-                            } else {
-                                // Mark room as needing sync after message added
-                                NEEDS_SYNC.write().insert(current_room);
-                            }
+                let message = MessageV1 {
+                    room_owner: MemberId::from(current_room),
+                    author: MemberId::from(&current_room_data.self_sk.verifying_key()),
+                    content,
+                    time: get_current_system_time(),
+                };
+                let auth_message =
+                    AuthorizedMessageV1::new(message, &current_room_data.self_sk);
+                let delta = ChatRoomStateV1Delta {
+                    recent_messages: Some(vec![auth_message.clone()]),
+                    ..Default::default()
+                };
+                info!("Sending message: {:?}", auth_message);
+                ROOMS.with_mut(|rooms| {
+                    if let Some(room_data) = rooms.map.get_mut(&current_room) {
+                        if let Err(e) = room_data.room_state.apply_delta(
+                            &current_room_data.room_state,
+                            &ChatRoomParametersV1 {
+                                owner: current_room,
+                            },
+                            &Some(delta),
+                        ) {
+                            error!("Failed to apply message delta: {:?}", e);
+                        } else {
+                            // Mark room as needing sync after message added
+                            NEEDS_SYNC.write().insert(current_room);
+
+                            // Request notification permission on first message
+                            request_permission_on_first_message();
                         }
-                    });
-                }
-            } else {
-                warn!("Message is empty");
+                    }
+                });
             }
         }
     };
@@ -312,43 +446,37 @@ pub fn Conversation() -> Element {
             div { class: "flex-1 overflow-y-auto",
                 div { class: "max-w-4xl mx-auto px-4 py-4",
                     {
-                        current_room_data.as_ref().map(|room_data| {
-                            let room_state = room_data.room_state.clone();
-                            let self_member_id = MemberId::from(&room_data.self_sk.verifying_key());
-
-                            if room_state.recent_messages.messages.is_empty() {
-                                rsx! {
+                        // Use memoized message groups to avoid expensive re-computation on keystrokes
+                        if current_room_data.is_some() {
+                            match message_groups.read().as_ref() {
+                                Some(groups) => {
+                                    let groups = groups.clone();
+                                    let groups_len = groups.len();
+                                    Some(rsx! {
+                                        div { class: "space-y-4",
+                                            {groups.into_iter().enumerate().map(|(group_idx, group)| {
+                                                let is_last_group = group_idx == groups_len - 1;
+                                                let key = group.messages[0].id.clone();
+                                                rsx! {
+                                                    MessageGroupComponent {
+                                                        key: "{key}",
+                                                        group: group,
+                                                        last_chat_element: if is_last_group { Some(last_chat_element) } else { None },
+                                                    }
+                                                }
+                                            })}
+                                        }
+                                    })
+                                }
+                                None => Some(rsx! {
                                     div { class: "flex flex-col items-center justify-center h-64 text-text-muted",
                                         p { "No messages yet. Start the conversation!" }
                                     }
-                                }
-                            } else {
-                                let groups = group_messages(
-                                    &room_state.recent_messages.messages,
-                                    &room_state.member_info,
-                                    self_member_id,
-                                    room_data.current_secret,
-                                    room_data.current_secret_version,
-                                );
-
-                                let groups_len = groups.len();
-                                rsx! {
-                                    div { class: "space-y-4",
-                                        {groups.into_iter().enumerate().map(|(group_idx, group)| {
-                                            let is_last_group = group_idx == groups_len - 1;
-                                            let key = group.messages[0].id.clone();
-                                            rsx! {
-                                                MessageGroupComponent {
-                                                    key: "{key}",
-                                                    group: group,
-                                                    last_chat_element: if is_last_group { Some(last_chat_element) } else { None },
-                                                }
-                                            }
-                                        })}
-                                    }
-                                }
+                                })
                             }
-                        })
+                        } else {
+                            None
+                        }
                     }
                 }
             }
@@ -360,10 +488,9 @@ pub fn Conversation() -> Element {
                         match room_data.can_send_message() {
                             Ok(()) => rsx! {
                                 MessageInput {
-                                    new_message: new_message,
-                                    handle_send_message: move |_evt| {
+                                    handle_send_message: move |text| {
                                         let handle = handle_send_message.clone();
-                                        handle()
+                                        handle(text)
                                     },
                                 }
                             },
@@ -379,10 +506,9 @@ pub fn Conversation() -> Element {
                                 } else {
                                     rsx! {
                                         MessageInput {
-                                            new_message: new_message,
-                                            handle_send_message: move |_evt| {
+                                            handle_send_message: move |text| {
                                                 let handle = handle_send_message.clone();
-                                                handle()
+                                                handle(text)
                                             },
                                         }
                                     }
@@ -421,7 +547,9 @@ fn MessageGroupComponent(
     group: MessageGroup,
     last_chat_element: Option<Signal<Option<Rc<MountedData>>>>,
 ) -> Element {
-    let time_str = group.first_time.format("%H:%M").to_string();
+    let timestamp_ms = group.first_time.timestamp_millis();
+    let time_str = format_utc_as_local_time(timestamp_ms);
+    let full_time_str = format_utc_as_full_datetime(timestamp_ms);
     let is_self = group.is_self;
 
     rsx! {
@@ -438,10 +566,14 @@ fn MessageGroupComponent(
                 // Header with name and time (only for others)
                 if !is_self {
                     div { class: "flex items-baseline gap-2 mb-1 px-1",
-                        span { class: "text-sm font-medium text-text",
+                        span {
+                            class: "text-sm font-medium text-text cursor-default",
+                            title: "Member ID: {group.author_id}",
                             "{group.author_name}"
                         }
-                        span { class: "text-xs text-text-muted",
+                        span {
+                            class: "text-xs text-text-muted cursor-default",
+                            title: "{full_time_str}",
                             "{time_str}"
                         }
                     }
@@ -513,7 +645,9 @@ fn MessageGroupComponent(
 
                 // Time for self messages (shown at the end)
                 if is_self {
-                    div { class: "text-xs text-text-muted mt-1 px-1",
+                    div {
+                        class: "text-xs text-text-muted mt-1 px-1 cursor-default",
+                        title: "{full_time_str}",
                         "{time_str}"
                     }
                 }
